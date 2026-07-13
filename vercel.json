@@ -4,9 +4,14 @@
     "api/index.mjs": {
       "runtime": "nodejs22.x",
       "maxDuration": 10
+    },
+    "api/test.mjs": {
+      "runtime": "nodejs22.x",
+      "maxDuration": 10
     }
   },
   "routes": [
+    { "src": "/api/test", "dest": "api/test.mjs" },
     { "src": "/api/(.*)", "dest": "api/index.mjs" }
   ]
 }
