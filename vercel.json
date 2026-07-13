@@ -1,12 +1,12 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "api/index.mjs",
-      "use": "@vercel/node"
+  "functions": {
+    "api/index.mjs": {
+      "runtime": "nodejs22.x",
+      "maxDuration": 10
     }
-  ],
+  },
   "routes": [
-    { "src": "/(.*)", "dest": "api/index.mjs" }
+    { "src": "/api/(.*)", "dest": "api/index.mjs" }
   ]
 }

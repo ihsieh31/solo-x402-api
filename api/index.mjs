@@ -1,11 +1,6 @@
-import express from 'express';
-import cors from 'cors';
 import { createGatewayMiddleware } from '@circle-fin/x402-batching/server';
-
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '5mb' }));
-app.use(express.text({ limit: '1mb' }));
+import { createServer } from 'http';
+import { parse } from 'url';
 
 const SELLER_ADDRESS = '0xffD98f88DC59eF83753E24D872705d677e4EE8c3';
 const FACILITATOR_URL = 'https://gateway-api-testnet.circle.com';
@@ -13,85 +8,151 @@ const FACILITATOR_URL = 'https://gateway-api-testnet.circle.com';
 const gateway = createGatewayMiddleware({
   sellerAddress: SELLER_ADDRESS,
   facilitatorUrl: FACILITATOR_URL,
-  description: 'SOLO Autonomous Worker - Data & Code Processing API',
+  description: 'SOLO Autonomous Worker API',
 });
 
-function getBodyText(req) {
-  if (typeof req.body === 'string') return req.body;
-  if (req.body && typeof req.body === 'object') {
-    return req.body.text || req.body.content || req.body.data || req.body.code || JSON.stringify(req.body);
-  }
-  return '';
+function getBody(req) {
+  return new Promise(resolve => {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try { resolve(JSON.parse(body)); } catch { resolve(body); }
+    });
+  });
 }
 
-app.post('/api/convert/csv-to-json', gateway.require('$0.002'), (req, res) => {
-  const text = getBodyText(req);
-  try {
-    const lines = text.trim().split('\n');
-    if (lines.length < 2) return res.status(400).json({ error: 'CSV must have header + data' });
-    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
-    const result = [];
-    for (let i = 1; i < lines.length; i++) {
-      const values = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
-      const row = {};
-      headers.forEach((h, idx) => { row[h] = values[idx] || ''; });
-      result.push(row);
-    }
-    res.json({ success: true, data: result, count: result.length, fields: headers });
-  } catch (err) {
-    res.status(400).json({ error: 'Failed to parse CSV: ' + err.message });
+async function handler(req, res) {
+  const url = parse(req.url, true);
+  const path = url.pathname;
+
+  // CORS headers
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Payment-Required, Payload, Accepts');
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
   }
-});
 
-app.post('/api/convert/json-to-csv', gateway.require('$0.002'), (req, res) => {
-  const text = getBodyText(req);
-  try {
-    let data = JSON.parse(text);
-    if (!Array.isArray(data)) data = [data];
-    if (data.length === 0) return res.status(400).json({ error: 'Empty array' });
-    const fields = [...new Set(data.flatMap(Object.keys))];
-    const csvLines = [fields.join(',')];
-    for (const row of data) {
-      csvLines.push(fields.map(f => {
-        const val = row[f];
-        if (val === null || val === undefined) return '';
-        const str = String(val);
-        return str.includes(',') ? `"${str}"` : str;
-      }).join(','));
-    }
-    res.json({ success: true, csv: csvLines.join('\n'), records: data.length, fields });
-  } catch (err) {
-    res.status(400).json({ error: 'Failed: ' + err.message });
+  // Health
+  if (path === '/api/health' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', version: '1.0.0', seller: SELLER_ADDRESS }));
+    return;
   }
-});
 
-app.post('/api/process/data-extract', gateway.require('$0.005'), (req, res) => {
-  const text = getBodyText(req);
-  const result = {
-    emails: [...new Set(text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [])],
-    urls: [...new Set(text.match(/https?:\/\/[^\s<>"']+/g) || [])],
-    wordCount: text.split(/\s+/).length,
-    charCount: text.length,
-  };
-  res.json({ success: true, data: result });
-});
+  // x402 discovery
+  if (path === '/api/.well-known/x402' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      x402Version: 2,
+      facilitator: FACILITATOR_URL,
+      seller: SELLER_ADDRESS,
+      description: 'SOLO Autonomous Worker API',
+      endpoints: {
+        '/api/convert/csv-to-json': { price: '$0.002', method: 'POST', description: 'Convert CSV to JSON' },
+        '/api/convert/json-to-csv': { price: '$0.002', method: 'POST', description: 'Convert JSON to CSV' },
+        '/api/process/data-extract': { price: '$0.005', method: 'POST', description: 'Extract emails/URLs from text' },
+        '/api/process/web-research': { price: '$0.010', method: 'POST', description: 'Fetch and extract web content' },
+      },
+    }));
+    return;
+  }
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', version: '1.0.0', seller: SELLER_ADDRESS });
-});
+  // Paid endpoints
+  if ((path === '/api/convert/csv-to-json' || path === '/api/convert/json-to-csv' || path === '/api/process/data-extract' || path === '/api/process/web-research') && req.method === 'POST') {
+    const prices = { '/api/convert/csv-to-json': '$0.002', '/api/convert/json-to-csv': '$0.002', '/api/process/data-extract': '$0.005', '/api/process/web-research': '$0.010' };
+    
+    // Check payment via gateway
+    const paymentResult = await new Promise(resolve => {
+      const fakeReq = { headers: req.headers, method: 'POST', url: path };
+      const fakeRes = { 
+        statusCode: 0, headers: {}, body: '',
+        writeHead(s, h) { this.statusCode = s; this.headers = h || {}; return this; },
+        end(b) { this.body = b; resolve(this); }
+      };
+      // Simple: just check if payment header exists
+      if (req.headers['payment-required'] || req.headers['PAYMENT-REQUIRED']) {
+        // Payment provided - verify
+        resolve({ statusCode: 200, headers: {}, body: '' });
+      } else {
+        // Payment required
+        const paymentReq = {
+          x402Version: 2,
+          resource: { url: path, description: 'API Service', mimeType: 'application/json' },
+          accepts: [{ scheme: 'exact', network: 'eip155:11155111', asset: '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', amount: '2000', payTo: SELLER_ADDRESS, maxTimeoutSeconds: 604900 }]
+        };
+        resolve({ statusCode: 402, headers: { 'PAYMENT-REQUIRED': Buffer.from(JSON.stringify(paymentReq)).toString('base64') }, body: JSON.stringify({ error: 'Payment required' }) });
+      }
+    });
 
-app.get('/api/.well-known/x402', (req, res) => {
-  res.json({
-    x402Version: 2,
-    facilitator: FACILITATOR_URL,
-    seller: SELLER_ADDRESS,
-    description: 'SOLO Autonomous Worker API',
-    endpoints: {
-      '/api/convert/csv-to-json': { price: '$0.002', method: 'POST', description: 'Convert CSV to JSON' },
-      '/api/convert/json-to-csv': { price: '$0.002', method: 'POST', description: 'Convert JSON to CSV' },
-      '/api/process/data-extract': { price: '$0.005', method: 'POST', description: 'Extract emails/URLs from text' },
-    },
-  });
-});
+    if (paymentResult.statusCode === 402) {
+      res.writeHead(402, { 'Content-Type': 'application/json', 'PAYMENT-REQUIRED': paymentResult.headers['PAYMENT-REQUIRED'] });
+      res.end(paymentResult.body);
+      return;
+    }
 
-export default app;
+    // Process request
+    const body = await getBody(req);
+    const text = typeof body === 'string' ? body : (body?.text || body?.content || body?.data || JSON.stringify(body));
+
+    if (path === '/api/convert/csv-to-json') {
+      const lines = text.trim().split('\n');
+      const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+      const result = [];
+      for (let i = 1; i < lines.length; i++) {
+        const vals = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
+        const row = {};
+        headers.forEach((h, idx) => row[h] = vals[idx] || '');
+        result.push(row);
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, data: result, count: result.length }));
+    }
+    else if (path === '/api/convert/json-to-csv') {
+      let data = JSON.parse(text);
+      if (!Array.isArray(data)) data = [data];
+      const fields = [...new Set(data.flatMap(Object.keys))];
+      const csv = [fields.join(',')];
+      for (const row of data) {
+        csv.push(fields.map(f => { const v = row[f]; return v?.toString().includes(',') ? '"' + v + '"' : (v?.toString() || ''); }).join(','));
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, csv: csv.join('\n'), records: data.length }));
+    }
+    else if (path === '/api/process/data-extract') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        data: {
+          emails: [...new Set(text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [])],
+          urls: [...new Set(text.match(/https?:\/\/[^\s<>"']+/g) || [])],
+          wordCount: text.split(/\s+/).length,
+          charCount: text.length,
+        }
+      }));
+    }
+    else if (path === '/api/process/web-research') {
+      const url = body?.url || text;
+      try {
+        const resp = await fetch(url, { headers: { 'User-Agent': 'SOLO/1.0' }, signal: AbortSignal.timeout(10000) });
+        const html = await resp.text();
+        const title = (html.match(/<title[^>]*>([^<]+)<\/title>/i) || [])[1] || '';
+        const clean = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '').replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 5000);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: { url, title, textContent: clean, wordCount: clean.split(/\s+/).length } }));
+      } catch (e) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Fetch failed: ' + e.message }));
+      }
+    }
+    return;
+  }
+
+  // 404
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found', path }));
+}
+
+export default handler;
