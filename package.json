@@ -1,0 +1,18 @@
+{
+  "name": "solo-x402-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node api/index.mjs",
+    "dev": "node api/index.mjs"
+  },
+  "dependencies": {
+    "@circle-fin/x402-batching": "^3.2.0",
+    "@x402/core": "^2.3.0",
+    "@x402/evm": "^2.3.0",
+    "express": "^4.18.0",
+    "cors": "^2.8.5",
+    "viem": "^2.0.0"
+  }
+}
